@@ -1,0 +1,31 @@
+{
+  "os": "Windows-10-10.0.26100-SP0",
+  "python": "CPython 3.11.11",
+  "startedAt": "2025-01-22T12:04:53.357606Z",
+  "program": "c:\\Users\\panka\\OneDrive\\Documents\\GitHub\\llm-bug-classification-software-testing\\src\\main_code.py",
+  "codePath": "src\\main_code.py",
+  "git": {
+    "remote": "https://github.com/kgandhi04/llm-bug-classification-software-testing.git",
+    "commit": "3281938b4a30c28f41ffa33d6755ef20f10f2273"
+  },
+  "email": "pankaj.webmaster@gmail.com",
+  "root": "c:\\Users\\panka\\OneDrive\\Documents\\GitHub\\llm-bug-classification-software-testing\\src",
+  "host": "Pankaj",
+  "executable": "c:\\Users\\panka\\anaconda3\\python.exe",
+  "codePathLocal": "main_code.py",
+  "cpu_count": 16,
+  "cpu_count_logical": 22,
+  "disk": {
+    "/": {
+      "total": "1022072524800",
+      "used": "604187271168"
+    }
+  },
+  "memory": {
+    "total": "33687597056"
+  },
+  "cpu": {
+    "count": 16,
+    "countLogical": 22
+  }
+}

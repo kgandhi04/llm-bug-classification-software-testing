@@ -1,0 +1,8 @@
+https://github.com/nlbse2023/issue-report-classification
+
+https://huggingface.co/PeppoCola/FewShotIssueClassifier-NLBSE23
+
+https://simpletransformers.ai/docs/usage/#configuring-a-simple-transformers-model
+
+
+https://github.com/nlbse2023/code-comment-classification

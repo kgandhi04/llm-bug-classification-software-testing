@@ -1,0 +1,18 @@
+# Ignore CSV files in specific directories
+datafiles/*.csv
+src/*.csv
+src/llm-testing/*.csv
+
+# Ignore all CSV files in the repository
+*.csv
+
+# Ignore Git LFS-tracked files (optional if using Git LFS)
+*.csv.lock
+
+# Ignore other large files (optional)
+*.log
+*.pkl
+*.h5
+*.npy
+*.parquet
+*.zip
