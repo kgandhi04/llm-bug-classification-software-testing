@@ -27,7 +27,7 @@ print("Datasets loaded successfully.")
 
 # Hugging Face login
 print("Logging into Hugging Face...")
-hf_token = "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"
+hf_token = "<HF TOKEN>"
 login(token=hf_token)
 print("Login successful.")
 
