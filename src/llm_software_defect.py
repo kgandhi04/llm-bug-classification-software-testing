@@ -15,8 +15,66 @@ drive.mount('/content/drive')
 !pip install datasets
 !pip install wandb
 !pip install simpletransformers
+!pip install git+https://github.com/huggingface/transformers
+
+
 
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import re
+import unicodedata
+import gensim
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import LabelEncoder
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+import joblib
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from huggingface_hub import login
+from transformers import EarlyStoppingCallback
+
+import os
+
+# Define the path where you want to save models and results in Google Drive
+drive_folder = "/content/drive/My Drive/Colab Notebooks/llm-software-quality/models/"
+
+# Create the directory if it doesn't exist
+os.makedirs(drive_folder, exist_ok=True)
+
+from gensim.parsing.preprocessing import remove_stopwords
+
+# Define regex patterns for text preprocessing
+function_sig_regex = re.compile(r'[a-zA-Z][a-zA-Z0-9_.]*\([a-zA-Z0-9_, ]*\)')
+issue_id_regex = re.compile(r'#[0-9]+')
+non_ascii_char_regex = re.compile(r'[^\x00-\x7f]')
+punctuations = r'!\'"`$%&\()*,/:;<=>[\\]^{|}~+#@-_'
+punctuations_trans = str.maketrans(punctuations, " " * len(punctuations))
+
+# Text preprocessing function
+def preprocess_text(text, max_tokens=None):
+    text = str(text).lower()  # Convert to lowercase
+    text = function_sig_regex.sub(" FUNCTION ", text)  # Replace function signatures
+    text = issue_id_regex.sub(" ISSUE ", text)  # Replace issue IDs
+    text = text.translate(punctuations_trans)  # Remove punctuations
+    text = non_ascii_char_regex.sub("", text)  # Remove non-ASCII characters
+    text = unicodedata.normalize('NFD', text)  # Normalize Unicode characters
+    text = gensim.parsing.preprocessing.strip_multiple_whitespaces(text)  # Remove multiple spaces
+    text = remove_stopwords(text)  # Remove stopwords
+
+    if max_tokens is not None:
+        text = " ".join(text.split()[:max_tokens])  # Limit to max tokens
+
+    return text
+# Hugging Face login
+print("Logging into Hugging Face...")
+hf_token = "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"
+login(token=hf_token)
+print("Login successful.")
 
 # File path example inside Google Drive
 train_dataset_path = '/content/drive/My Drive/Colab Notebooks/llm-software-quality/datafiles/train.csv'
@@ -28,345 +86,152 @@ test_df = pd.read_csv(test_dataset_path)
 # test_df=test_df.head(10000)
 print("Datasets loaded successfully.")
 
-#!pip install simpletransformers
+# Combine 'title' and 'body' and preprocess text
+train_df['text'] = (train_df['title'] + " " + train_df['body']).apply(preprocess_text)
 
-import os
-import time
-import numpy as np
-import pandas as pd
-import gensim
-import sklearn.metrics
-import re
-import unicodedata
-from tqdm import tqdm
-import torch
-from simpletransformers.classification import ClassificationModel, ClassificationArgs
-import wandb
-import csv
-from functools import partial
-import itertools
-import random
-import sys
-import hashlib
-import time
+# Encode labels
+label_encoder = LabelEncoder()
+train_df['label_encoded'] = label_encoder.fit_transform(train_df['labels'])
 
-train_file = '/content/drive/My Drive/Colab Notebooks/llm-software-quality/datafiles/train.csv'
-test_file = '/content/drive/My Drive/Colab Notebooks/llm-software-quality/datafiles/test.csv'
+# Sample 25,000 instances per label
+train_df = train_df.groupby('label_encoded', group_keys=False).apply(lambda x: x.sample(min(len(x), 25000), random_state=42)).reset_index(drop=True)
 
-csv.field_size_limit(sys.maxsize) # to avoid error: _csv.Error: field larger than field limit (131072)
+# Split data
+train_texts, val_texts, train_labels, val_labels = train_test_split(
+    train_df['text'], train_df['label_encoded'], test_size=0.2, random_state=42, stratify=train_df['label_encoded']
+)
 
-def count_tokens(text):
-	return len(text.split())
+# Define dataset class
+class TextDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_length=512):
+        self.encodings = tokenizer(texts.tolist(), padding='max_length', truncation=True, max_length=max_length, return_tensors='pt')
+        self.labels = torch.tensor(labels.tolist(), dtype=torch.long)
 
-def count_csv_rows(csv_file):
-	with open(csv_file, 'r', newline='', encoding='utf-8') as f:
-		return sum(1 for _ in csv.DictReader(f))
+    def __len__(self):
+        return len(self.labels)
 
-def print_csv_preview(filename, sep=None):
-	print(filename)
-	print("total rows", count_csv_rows(filename))
-	display(pd.read_csv(filename, nrows=5, sep=sep))
+    def __getitem__(self, idx):
+        item = {key: val[idx] for key, val in self.encodings.items()}
+        item['labels'] = self.labels[idx]
+        return item
 
-def sample_csv(file, n_sample):
-	n_population = count_csv_rows(file)
-	skiprows = random.sample(range(1, n_population), n_population - n_sample)
-	return pd.read_csv(file, skiprows=skiprows)
-
-function_sig_regex = re.compile(r'[a-zA-Z][a-zA-Z0-9_.]*\([a-zA-Z0-9_, ]*\)')
-issue_id_regex = re.compile(r'#[0-9]+')
-non_ascii_char_regex = re.compile(r'[^\x00-\x7f]')
-punctuations = '!\'"`$%&\()*,/:;<=>[\\]^{|}~+#@-_'
-punctuations_trans = str.maketrans(punctuations, " " * len(punctuations))
-
-def preprocess(text, max_tokens=None):
-  text = str(text)
-
-  # replace function signatures
-  text = function_sig_regex.sub(" FUNCTION ", text)
-
-  # replace issue ids
-  text = issue_id_regex.sub(" ISSUE ", text)
-
-  # remove html tags
-  # text = gensim.parsing.preprocessing.strip_tags(text)
-
-  # remove punctuation
-  text = text.translate(punctuations_trans)
-
-  # remove numerics
-  # text = gensim.parsing.preprocessing.strip_numeric(text)
-
-  # remove non-ascii characters
-  text = non_ascii_char_regex.sub("", text)
-
-  text = unicodedata.normalize('NFD', text)
-
-  # remove consecutive whitespace characters and convert tabs to spaces
-  text = gensim.parsing.preprocessing.strip_multiple_whitespaces(text)
-
-  # limit the number of tokens
-  if max_tokens is not None:
-    text = " ".join(text.split()[:max_tokens])
-
-  return text
-
-sample_df = sample_csv(train_file, 50_000)
-
-q=[.5, .75, .8, .85, .9, .95, .99, .999]
-
-display("title token count quantiles", sample_df["title"].apply(preprocess).apply(count_tokens).quantile(q=q))
-display("body token count quantiles", sample_df["body"].apply(preprocess).apply(count_tokens).quantile(q=q))
-
-def preprocess_row(row):
-  doc = "TITLE " + preprocess(row["title"], max_tokens=20) # 99% of titles fit
-  doc += " BODY " + preprocess(row["body"], max_tokens=511-count_tokens(doc))
-
-  assert count_tokens(doc) <= 512
-
-  return doc
-
-def transform_to_simpletransformers_format(i_path, o_path):
-	label_map = {"bug": 0, "feature": 1, "question": 2, "documentation": 3 }
-
-	with open(i_path, "r") as i_f, open(o_path, "w") as o_f:
-		reader = csv.DictReader(i_f)
-		writer = csv.DictWriter(o_f, fieldnames=["text", "labels"], delimiter="\t")
-		writer.writeheader()
-		total = count_csv_rows(i_path)
-		for row in tqdm(reader, desc="Transform to simpletransformers format", total=total):
-			text = preprocess_row(row)
-			labels = label_map[row["labels"]]
-			writer.writerow({"text": text, "labels": labels})
-
-transform_to_simpletransformers_format(train_file, "train.csv")
-transform_to_simpletransformers_format(test_file, "test.csv")
-
-df_train_limit=pd.read_csv("train.csv")
-df_train_limit=df_train_limit.head(100000)
-df_train_limit.to_csv("train.csv", index=False)
-
-#Do the same for test
-df_test_limit=pd.read_csv("test.csv")
-df_test_limit=df_test_limit.head(10000)
-df_test_limit.to_csv("test.csv", index=False)
-
-print_csv_preview("train.csv", sep='\t')
-print_csv_preview("test.csv", sep='\t')
-
-
-
-def model_args():
-  timestamp = str(int(time.time()))
-
-  # https://simpletransformers.ai/docs/usage/#configuring-a-simple-transformers-model
-  args = ClassificationArgs()
-
-  args.max_seq_length = 224
-  args.learning_rate = 1e-5 # 4e-5
-  args.num_train_epochs = 16
-  args.train_batch_size = 64
-  args.eval_batch_size = 64
-  args.gradient_accumulation_steps = 1
-
-  # custom evaluation metric
-  # https://github.com/ThilinaRajapakse/simpletransformers/discussions/911
-  args.use_early_stopping = False
-  args.early_stopping_metric = "f1_micro"
-  args.early_stopping_metric_minimize = False
-
-  # evaluate at end of each epoch
-  args.evaluate_during_training = True
-  args.evaluate_during_training_steps = int(1e20) # never
-  # args.evaluate_during_training_steps = 1.5  * 60 * 60 // args.gradient_accumulation_steps # target 1h
-
-  # https://simpletransformers.ai/docs/classification-specifics/#lazy-loading-data
-  args.lazy_loading = True
-
-  args.save_steps = -1
-  args.logging_steps = max(1, 1.6 * 30 // args.gradient_accumulation_steps) # target 30s
-  args.manual_seed = 0
-
-  args.output_dir = f"outputs/{timestamp}"
-  args.best_model_dir = f"{args.output_dir}/best_model"
-
-  # https://docs.wandb.ai/guides/integrations/other/simpletransformers
-  # https://simpletransformers.ai/docs/tips-and-tricks/#visualization-support
-  # args.wandb_project = "NLBSE'23 Issue Report Classification"
-  # args.wandb_kwargs = {"entity": "nlbse", "notes": f"timestamp:{timestamp}"}
-
-  return args
-
-metrics = {
-  "precision_bug": partial(sklearn.metrics.precision_score, average=None, labels=[0]),
-  "recall_bug": partial(sklearn.metrics.recall_score, average=None, labels=[0]),
-  "f1_bug": partial(sklearn.metrics.f1_score, average=None, labels=[0]),
-
-  "precision_feature": partial(sklearn.metrics.precision_score, average=None, labels=[1]),
-  "recall_feature": partial(sklearn.metrics.recall_score, average=None, labels=[1]),
-  "f1_feature": partial(sklearn.metrics.f1_score, average=None, labels=[1]),
-
-  "precision_question": partial(sklearn.metrics.precision_score, average=None, labels=[2]),
-  "recall_question": partial(sklearn.metrics.recall_score, average=None, labels=[2]),
-  "f1_question": partial(sklearn.metrics.f1_score, average=None, labels=[2]),
-
-  "precision_documentation": partial(sklearn.metrics.precision_score, average=None, labels=[3]),
-  "recall_documentation": partial(sklearn.metrics.recall_score, average=None, labels=[3]),
-  "f1_documentation": partial(sklearn.metrics.f1_score, average=None, labels=[3]),
-
-  "precision_micro": partial(sklearn.metrics.precision_score, average='micro'),
-  "recall_micro": partial(sklearn.metrics.recall_score, average='micro'),
-  "f1_micro": partial(sklearn.metrics.f1_score, average='micro'),
+# Define models
+models = {
+    "BERT": "google-bert/bert-base-uncased",
+    "ModernBERT": "answerdotai/ModernBERT-base",
+    "RoBERTa": "FacebookAI/roberta-base"
 }
 
-model = ClassificationModel(
-  'roberta',
-  'roberta-base',
-  args=model_args(),
-  num_labels=4
-)
+# Train and evaluate each model
+results = {}
+for model_name, model_path in models.items():
+    print(f"\nTraining {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    train_dataset = TextDataset(train_texts, train_labels, tokenizer)
+    val_dataset = TextDataset(val_texts, val_labels, tokenizer)
 
-model.train_model(train_df="train.csv", eval_df="test.csv", **metrics)
+    model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=len(label_encoder.classes_))
 
-from transformers import AutoModel
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-from simpletransformers.classification import ClassificationModel
+    training_args = TrainingArguments(
+        output_dir=f'./results_{model_name}',
+        evaluation_strategy='epoch',
+        learning_rate=1e-5,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
+        num_train_epochs=10,
+        weight_decay=0.01,
+        logging_dir=f'./logs_{model_name}',
+        report_to='none',
+        save_strategy='epoch',
+        save_total_limit=3,
+        logging_first_step=True,
+        logging_steps=1,
+        metric_for_best_model='eval_loss',
+        load_best_model_at_end=True
+    )
 
-# Define model name
-model_name = "roberta_best_model"
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
+    )
 
-# Load the model
-model = ClassificationModel(
-    "roberta",
-    "outputs/1737977283/best_model",
-    args=model_args(),
-    num_labels=4,
-    local_files_only=True
-)
+    trainer.train()
 
-# Load evaluation dataset with tab delimiter
-eval_df = pd.read_csv("test.csv", delimiter='\t')
+    # Save the trained model and tokenizer to Google Drive
+    model_save_path = os.path.join(drive_folder, f"{model_name}_model")
+    tokenizer_save_path = os.path.join(drive_folder, f"{model_name}_tokenizer")
 
-# Define custom evaluation metrics (if required)
-def metrics(preds, labels):
-    accuracy = accuracy_score(labels, preds)
-    return {"accuracy": accuracy}
+    trainer.save_model(model_save_path)
+    tokenizer.save_pretrained(tokenizer_save_path)
 
-# Evaluate the model
-results, model_outputs, wrong_preds = model.eval_model("test.csv", **{"acc": metrics})
+    print(f"Model {model_name} saved to {model_save_path}.")
 
-# Save the results to a CSV file with model name suffix
-results_df = pd.DataFrame(results)
-results_file = f"results_{model_name}.csv"
-results_df.to_csv(results_file, index=False)
-print(f"Results saved to: {results_file}")
+    predictions = trainer.predict(val_dataset)
+    y_preds = torch.argmax(torch.tensor(predictions.predictions), dim=1).numpy()
 
-# Extract true and predicted labels
-true_labels = eval_df["labels"].tolist()  # Ensure this column exists in your CSV
-predicted_labels = model_outputs.argmax(axis=1)  # Convert logits to class predictions
+    # Save results
+    report = classification_report(val_labels, y_preds, target_names=label_encoder.classes_, output_dict=True)
+    results[model_name] = report
 
-# Calculate confusion matrix
-conf_matrix = confusion_matrix(true_labels, predicted_labels)
+    # Confusion Matrix
+    conf_matrix = confusion_matrix(val_labels, y_preds)
+    plt.figure(figsize=(10, 7))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title(f'Confusion Matrix - {model_name}')
+    plt.savefig(f'conf_matrix_{model_name}.png')
+    plt.close()
 
-# Calculate performance metrics
-accuracy = accuracy_score(true_labels, predicted_labels)
-precision = precision_score(true_labels, predicted_labels, average='weighted', zero_division=0)
-recall = recall_score(true_labels, predicted_labels, average='weighted', zero_division=0)
-f1 = f1_score(true_labels, predicted_labels, average='weighted', zero_division=0)
+# Train FastText Model
+print("\nTraining FastText Model...")
+vectorizer = TfidfVectorizer(max_features=10000)
+X_train_tfidf = vectorizer.fit_transform(train_texts)
+X_val_tfidf = vectorizer.transform(val_texts)
 
-# Print performance metrics
-print(f"Accuracy: {accuracy:.4f}")
-print(f"Precision: {precision:.4f}")
-print(f"Recall: {recall:.4f}")
-print(f"F1-Score: {f1:.4f}")
+fasttext_model = LogisticRegression(max_iter=500)
+fasttext_model.fit(X_train_tfidf, train_labels)
+y_preds_fasttext = fasttext_model.predict(X_val_tfidf)
 
-# Save performance metrics to CSV
-metrics_df = pd.DataFrame({
-    "Metric": ["Accuracy", "Precision", "Recall", "F1-Score"],
-    "Value": [accuracy, precision, recall, f1]
-})
-metrics_file = f"metrics_{model_name}.csv"
-metrics_df.to_csv(metrics_file, index=False)
-print(f"Metrics saved to: {metrics_file}")
+# Save results for FastText
+report_fasttext = classification_report(val_labels, y_preds_fasttext, target_names=label_encoder.classes_, output_dict=True)
+results["FastText"] = report_fasttext
 
-# Plot confusion matrix
-plt.figure(figsize=(8, 6))
-sns.heatmap(conf_matrix, annot=True, fmt="d", cmap="Blues", xticklabels=range(4), yticklabels=range(4))
-plt.xlabel("Predicted")
-plt.ylabel("Actual")
-plt.title(f"Confusion Matrix - Accuracy: {accuracy:.4f}")
+# Confusion Matrix for FastText
+conf_matrix_fasttext = confusion_matrix(val_labels, y_preds_fasttext)
+plt.figure(figsize=(10, 7))
+sns.heatmap(conf_matrix_fasttext, annot=True, fmt='d', cmap='Blues', xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix - FastText')
+plt.savefig('conf_matrix_FastText.png')
+plt.close()
 
-# Save confusion matrix with model name suffix
-confusion_matrix_file = f"confusion_matrix_{model_name}.png"
-plt.savefig(confusion_matrix_file)
-plt.show()
-print(f"Confusion matrix saved to: {confusion_matrix_file}")
+# Save results
+joblib.dump(results, "model_evaluation_results.pkl")
 
+print("All models trained and evaluated successfully.")
 
+import joblib
+import shutil
 
-from tqdm import tqdm
-from transformers import pipeline
-from datasets import load_dataset
-from transformers.pipelines.pt_utils import KeyDataset
-import sklearn.metrics
+# Save FastText Model and TF-IDF Vectorizer
+joblib.dump(fasttext_model, os.path.join(drive_folder, "fasttext_model.pkl"))
+joblib.dump(vectorizer, os.path.join(drive_folder, "tfidf_vectorizer.pkl"))
 
-# classifier = pipeline(model="./best_model/", tokenizer="./best_model/")
-classifier = pipeline(model="rafaelkallis/tickettagger-roberta", max_length=224, truncation=True, device=0, batch_size=256)
+print(f"FastText model saved at {drive_folder}.")
 
-dataset = load_dataset('csv', data_files={"test": "test.csv"}, delimiter='\t')
+# Save evaluation results
+joblib.dump(results, os.path.join(drive_folder, "model_evaluation_results.pkl"))
 
-y_true = dataset["test"]["labels"]
-id2label = {0: "bug", 1: "feature", 2: "question", 3: "documentation"}
-y_true = [id2label[y] for y in y_true]
+# Save confusion matrices
+for model_name in models.keys():
+    conf_matrix_path = f'conf_matrix_{model_name}.png'
+    shutil.move(conf_matrix_path, os.path.join(drive_folder, conf_matrix_path))
 
-y_pred = list(tqdm(classifier(KeyDataset(dataset["test"], "text")), total=len(y_true)))
-y_pred = [p["label"] for p in y_pred]
+shutil.move('conf_matrix_FastText.png', os.path.join(drive_folder, 'conf_matrix_FastText.png'))
 
-for label in ["bug", "feature", "question", "documentation"]:
-  P_c = sklearn.metrics.precision_score(y_true, y_pred, average=None, labels=[label])[0]
-  R_c = sklearn.metrics.recall_score(y_true, y_pred, average=None, labels=[label])[0]
-  F1_c = sklearn.metrics.f1_score(y_true, y_pred, average=None, labels=[label])[0]
-  print(f"=*= {label} =*=")
-  print(f"precision:\t{P_c:.4f}")
-  print(f"recall:\t\t{R_c:.4f}")
-  print(f"F1 score:\t{F1_c:.4f}")
-  print()
-
-
-P = sklearn.metrics.precision_score(y_true, y_pred, average='micro')
-R = sklearn.metrics.recall_score(y_true, y_pred, average='micro')
-F1 = sklearn.metrics.f1_score(y_true, y_pred, average='micro')
-
-print("=*= micro averages =*=")
-print(f"precision:\t{P:.4f}")
-print(f"recall:\t\t{R:.4f}")
-print(f"F1 score:\t{F1:.4f}")
-
-##Only take the test data where the prediction is good
-
-df_test=pd.read_csv("test.csv",delimiter='\t')
-id2label = {0: "bug", 1: "feature", 2: "question", 3: "documentation"}
-y_true = df_test["labels"]
-y_true = [id2label[y] for y in y_true]
-df_test["predicted"]=y_pred
-df_test["labels"]=y_true
-#create a difference column
-df_test["diff"]=df_test["predicted"]!=df_test["labels"]
-#Take only rows where they both are equal
-df_test=df_test[df_test["diff"]==False]
-#drop the difference column
-df_test=df_test.drop("diff",axis=1)
-#reset dataframe
-df_test=df_test.reset_index(drop=True)
-
-#Convert the labels back to numbers
-label2id = {"bug": 0, "feature": 1, "question": 2, "documentation": 3 }
-df_test["labels"]=df_test["labels"].map(label2id)
-
-#Drop predicted column
-del df_test["predicted"]
-
-df_test.to_csv("test_predictions_data.csv", index=False)
-df_test.head()
+print("All models, evaluation reports, and confusion matrices saved successfully in Google Drive.")
